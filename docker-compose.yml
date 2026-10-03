@@ -1,0 +1,35 @@
+﻿services:
+  postgres:
+    image: postgres:16
+    container_name: clinique_mughulungu_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - clinique_pgdata:/var/lib/postgresql/data
+      - ./postgresql/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    container_name: clinique_mughulungu_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CLINIQUE_DATABASE_URL: ${CLINIQUE_DATABASE_URL}
+      CLINIQUE_SECRET_KEY: ${CLINIQUE_SECRET_KEY}
+      CLINIQUE_HOST: ${CLINIQUE_HOST}
+      CLINIQUE_PORT: ${CLINIQUE_PORT}
+    ports:
+      - "8000:8000"
+
+volumes:
+  clinique_pgdata:

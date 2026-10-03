@@ -1,0 +1,27 @@
+CLINIQUE MUGHULUNGU — V1.3 PREPARATION POSTGRESQL
+
+ETAT
+----
+[PASS] Couche de connexion capable de sélectionner PostgreSQL via
+       CLINIQUE_DATABASE_URL.
+[PASS] Mode SQLite conservé pour développement.
+[PASS] Paramètres SQL adaptés au pilote PostgreSQL.
+[PASS] Schéma PostgreSQL fourni.
+[PASS] Rôles et permissions initialisés.
+[PASS] Audit et modules métier conservés.
+[PASS] Sauvegarde PostgreSQL préparée avec pg_dump.
+
+NON DECLARE COMME TESTE
+-----------------------
+L'exécution HTTP réelle avec Flask + PostgreSQL n'a pas été exécutée dans
+l'environnement de construction actuel. La recette réelle doit être faite
+dans l'environnement cible avec PostgreSQL disponible.
+
+CREDENTIEL INITIAL
+------------------
+admin / ChangeMe-Admin-2026!
+Changer immédiatement ce mot de passe au premier déploiement.
+
+PERIMETRE
+---------
+Aucune fonctionnalité métier étrangère au cahier des charges n'a été ajoutée.

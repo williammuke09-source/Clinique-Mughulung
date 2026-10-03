@@ -1,0 +1,64 @@
+CLINIQUE MUGHULUNGU — V1.5 PRODUCTION
+
+OBJECTIF
+Cette livraison ajoute la procédure technique permettant de lancer la version
+PostgreSQL dans un environnement Docker avec PostgreSQL 16 et Gunicorn.
+
+1. PRÉPARATION
+- Installer Docker et Docker Compose sur le serveur.
+- Copier le dossier du projet.
+- Modifier les deux valeurs CHANGE_ME dans docker-compose.yml:
+  * mot de passe PostgreSQL
+  * CLINIQUE_SECRET_KEY
+- Ne jamais conserver les valeurs d'exemple en production.
+
+2. DÉMARRAGE
+docker compose up -d --build
+
+Le service PostgreSQL initialise le schéma depuis:
+postgresql/schema.sql
+
+L'application démarre ensuite avec:
+Gunicorn -> clinique_mughulungu:app
+
+Port par défaut:
+8000
+
+3. VÉRIFICATION
+docker compose ps
+docker compose logs postgres
+docker compose logs app
+
+Puis ouvrir:
+http://SERVEUR:8000/login
+
+Compte initial:
+admin
+ChangeMe-Admin-2026!
+
+Le mot de passe doit être changé avant l'utilisation réelle.
+
+4. TEST POSTGRESQL RÉEL
+Dans le conteneur application:
+docker compose exec app python postgresql/smoke_test.py
+
+5. TEST HTTP
+Le test automatique fourni utilise SQLite temporaire et nécessite les
+dépendances installées:
+docker compose exec app python tests/test_http_smoke.py
+
+6. SAUVEGARDE
+Utiliser le script PostgreSQL fourni ou une commande pg_dump côté serveur.
+Ne pas utiliser une simple copie du fichier SQLite lorsque PostgreSQL est
+la base de production.
+
+7. LIMITE DE VALIDATION DE CETTE CONSTRUCTION
+Le présent environnement de développement n'a pas de daemon Docker ni de
+serveur PostgreSQL accessible. Les conteneurs ne peuvent donc pas être
+démarrés ici. Les fichiers de déploiement sont néanmoins inclus et le code
+Python a été recompilé après les corrections V1.4.
+
+8. PÉRIMÈTRE
+Aucune fonctionnalité métier étrangère au cahier des charges n'a été ajoutée.
+Les ajouts de cette version sont uniquement techniques: conteneurisation,
+serveur WSGI et procédure de déploiement.

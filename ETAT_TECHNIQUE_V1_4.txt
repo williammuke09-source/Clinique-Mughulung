@@ -1,0 +1,20 @@
+CLINIQUE MUGHULUNGU — V1.4 — INTÉGRATION POSTGRESQL / TESTS
+
+Corrections apportées
+- Compatibilité des lignes PostgreSQL avec les accès utilisés par l'application:
+  row['nom'] et row[0] sont désormais supportés.
+- Compatibilité de lastrowid: PostgreSQL utilise RETURNING id via un curseur
+  de compatibilité.
+- role_permissions est exclue de RETURNING id car elle n'a pas de colonne id.
+
+Tests préparés
+- tests/test_http_smoke.py : test HTTP Flask sur SQLite temporaire.
+- postgresql/smoke_test.py : test réel de connexion PostgreSQL et vérification
+  des tables requises.
+
+Limitation actuelle
+- L'environnement de construction ne dispose ni de Flask ni d'un serveur
+  PostgreSQL.
+- L'installation réseau des dépendances a échoué; les tests réels ne peuvent
+  donc pas être exécutés ici.
+- Aucun résultat d'intégration réel n'est déclaré sans environnement cible.

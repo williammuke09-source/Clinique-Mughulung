@@ -1,0 +1,55 @@
+CLINIQUE MUGHULUNGU — CHECKLIST PRÉ-PRODUCTION
+
+Infrastructure
+[ ] Docker / Docker Compose
+[ ] PostgreSQL
+[ ] Volume persistant
+[ ] Secrets de production
+[ ] Accès réseau contrôlé
+
+RBAC / sécurité
+[ ] Administrateur
+[ ] Réceptionniste
+[ ] Médecin
+[ ] Infirmier
+[ ] Pharmacien
+[ ] Comptable
+[ ] Direction
+[ ] Contrôle serveur des permissions
+[ ] Sessions sécurisées
+[ ] Déconnexion automatique
+[ ] Protection connexions répétées
+[ ] Désactivation compte
+[ ] Journalisation
+
+Modules
+[ ] Patients
+[ ] Rendez-vous
+[ ] Triage/constants
+[ ] Consultation/dossier
+[ ] Prescriptions
+[ ] Laboratoire
+[ ] Hospitalisation
+[ ] Pharmacie
+[ ] Stock/inventaire/alertes
+[ ] Comptabilité
+[ ] Direction
+[ ] Rapports/PDF
+
+Audit
+[ ] utilisateur/action/module/date-heure/objet/résultat
+[ ] corrections/annulations traçables
+
+Sauvegarde
+[ ] pg_dump exécuté
+[ ] restauration testée
+[ ] procédure documentée
+
+Gel V1.0
+[ ] aucune erreur bloquante
+[ ] 7 rôles testés
+[ ] modules testés
+[ ] sécurité/RBAC testée
+[ ] audit testé
+[ ] rapports/PDF testés
+[ ] sauvegarde/restauration testée

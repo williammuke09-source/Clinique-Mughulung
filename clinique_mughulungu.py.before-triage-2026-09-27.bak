@@ -1,0 +1,558 @@
+import os, sqlite3, secrets, re
+from datetime import datetime, timedelta
+from functools import wraps
+from pathlib import Path
+from flask import Flask, request, redirect, url_for, session, flash, abort, render_template_string, send_file
+from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+ import psycopg
+ from psycopg.rows import dict_row
+ from psycopg import IntegrityError as PGIntegrityError
+except ImportError:
+ psycopg = None
+ dict_row = None
+ PGIntegrityError = Exception
+
+class PGRow(dict):
+ def __getitem__(self, key):
+  if isinstance(key, int):
+   return list(self.values())[key]
+  return super().__getitem__(key)
+
+class PGCursorCompat:
+ def __init__(self, cursor):
+  self._cursor=cursor
+  self.lastrowid=None
+ def _convert(self, row):
+  if row is None: return None
+  if isinstance(row, dict): return PGRow(row)
+  cols=[d.name if hasattr(d,'name') else d[0] for d in self._cursor.description]
+  return PGRow(zip(cols,row))
+ def fetchone(self): return self._convert(self._cursor.fetchone())
+ def fetchall(self): return [self._convert(r) for r in self._cursor.fetchall()]
+ def __getattr__(self,name): return getattr(self._cursor,name)
+
+APP='CLINIQUE MUGHULUNGU'
+BASE=Path(__file__).resolve().parent
+DB=Path(os.getenv('CLINIQUE_DB_PATH', BASE/'clinique_mughulungu.db'))
+DATABASE_URL=os.getenv('CLINIQUE_DATABASE_URL','').strip()
+ROLES=['Administrateur','Réceptionniste','Médecin','Infirmier','Pharmacien','Comptable','Direction']
+app=Flask(__name__)
+app.config.update(SECRET_KEY=os.getenv('CLINIQUE_SECRET_KEY',secrets.token_hex(32)),SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',PERMANENT_SESSION_LIFETIME=timedelta(minutes=30))
+
+def is_postgres():
+ return bool(DATABASE_URL)
+
+def _sql(sql):
+ if not is_postgres(): return sql
+ sql=sql.replace('INSERT OR IGNORE INTO','INSERT INTO')
+ sql=re.sub(r"date\('now'\)", 'CURRENT_DATE', sql, flags=re.I)
+ return sql.replace('?', '%s')
+
+class PGConn:
+ def __init__(self):
+  if psycopg is None: raise RuntimeError('psycopg est requis lorsque CLINIQUE_DATABASE_URL est configuré.')
+  self.c=psycopg.connect(DATABASE_URL, row_factory=dict_row)
+ def execute(self,sql,params=()):
+  sql=_sql(sql)
+  upper=sql.lstrip().upper()
+  if upper.startswith('INSERT INTO') and 'ON CONFLICT' not in upper and any(t in sql.lower() for t in ('roles','permissions','role_permissions')):
+   sql += ' ON CONFLICT DO NOTHING'
+  m=re.match(r'INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)',sql,re.I)
+  if m and m.group(1).lower() != 'role_permissions' and 'RETURNING' not in upper:
+   sql += ' RETURNING id'
+  cur=PGCursorCompat(self.c.execute(sql, params))
+  if m and m.group(1).lower() != 'role_permissions':
+   row=cur.fetchone()
+   cur.lastrowid = row['id'] if row is not None and 'id' in row else None
+  return cur
+ def commit(self): self.c.commit()
+ def rollback(self): self.c.rollback()
+ def close(self): self.c.close()
+
+def con():
+ if is_postgres(): return PGConn()
+ c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
+def now(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+def init_db():
+ if not is_postgres():
+  DB.parent.mkdir(parents=True,exist_ok=True); c=con()
+  c.executescript('''
+ CREATE TABLE IF NOT EXISTS roles(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);
+ CREATE TABLE IF NOT EXISTS permissions(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,module TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS role_permissions(role_id INTEGER NOT NULL,permission_id INTEGER NOT NULL,PRIMARY KEY(role_id,permission_id),FOREIGN KEY(role_id) REFERENCES roles(id) ON DELETE CASCADE,FOREIGN KEY(permission_id) REFERENCES permissions(id) ON DELETE CASCADE);
+ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role_id INTEGER NOT NULL,is_active INTEGER NOT NULL DEFAULT 1,failed_attempts INTEGER NOT NULL DEFAULT 0,locked_until TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(role_id) REFERENCES roles(id));
+ CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT NOT NULL,module TEXT NOT NULL,date_time TEXT NOT NULL,object_type TEXT,object_id INTEGER,result TEXT NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS patients(id INTEGER PRIMARY KEY,patient_number TEXT UNIQUE NOT NULL,last_name TEXT NOT NULL,post_name TEXT,first_name TEXT NOT NULL,sex TEXT NOT NULL,birth_date TEXT,birth_place TEXT,address TEXT,phone TEXT,profession TEXT,admin_info TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS patient_contacts(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,name TEXT NOT NULL,relationship TEXT,phone TEXT,FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE CASCADE);
+ CREATE TABLE IF NOT EXISTS appointments(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,doctor_id INTEGER,service TEXT,appointment_date TEXT NOT NULL,appointment_time TEXT NOT NULL,reason TEXT,status TEXT NOT NULL DEFAULT 'Prévu',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(doctor_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS triage_records(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,temperature REAL,weight REAL,blood_pressure TEXT,heart_rate REAL,respiratory_rate REAL,oxygen_saturation REAL,height REAL,bmi REAL,pain_scale INTEGER,observation TEXT,recorded_by INTEGER,recorded_at TEXT NOT NULL,FOREIGN KEY(patient_id) REFERENCES patients(id));
+ CREATE TABLE IF NOT EXISTS medical_records(id INTEGER PRIMARY KEY,patient_id INTEGER UNIQUE NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(patient_id) REFERENCES patients(id));
+ CREATE TABLE IF NOT EXISTS consultations(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,medical_record_id INTEGER NOT NULL,doctor_id INTEGER NOT NULL,consultation_date TEXT NOT NULL,complaint TEXT,history TEXT,temperature REAL,weight REAL,blood_pressure TEXT,heart_rate REAL,respiratory_rate REAL,oxygen_saturation REAL,clinical_exam TEXT,primary_diagnosis TEXT,secondary_diagnosis TEXT,hypotheses TEXT,treatment TEXT,advice TEXT,next_appointment TEXT,referral TEXT,hospitalization_needed INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(medical_record_id) REFERENCES medical_records(id),FOREIGN KEY(doctor_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS prescriptions(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,consultation_id INTEGER,prescribed_by INTEGER NOT NULL,prescription_date TEXT NOT NULL,instructions TEXT,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(consultation_id) REFERENCES consultations(id),FOREIGN KEY(prescribed_by) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS prescription_items(id INTEGER PRIMARY KEY,prescription_id INTEGER NOT NULL,medicine_id INTEGER,medicine_name TEXT NOT NULL,dosage TEXT,frequency TEXT,duration TEXT,instructions TEXT,FOREIGN KEY(prescription_id) REFERENCES prescriptions(id) ON DELETE CASCADE,FOREIGN KEY(medicine_id) REFERENCES medicines(id));
+ CREATE TABLE IF NOT EXISTS laboratory_requests(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,prescriber_id INTEGER NOT NULL,exam_requested TEXT NOT NULL,sample TEXT,request_date TEXT NOT NULL,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(prescriber_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS laboratory_results(id INTEGER PRIMARY KEY,laboratory_request_id INTEGER NOT NULL,result TEXT,conclusion TEXT,result_date TEXT NOT NULL,recorded_by INTEGER,FOREIGN KEY(laboratory_request_id) REFERENCES laboratory_requests(id) ON DELETE CASCADE,FOREIGN KEY(recorded_by) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS hospitalizations(id INTEGER PRIMARY KEY,hospitalization_number TEXT UNIQUE NOT NULL,patient_id INTEGER NOT NULL,doctor_id INTEGER NOT NULL,service TEXT,entry_datetime TEXT NOT NULL,reason TEXT,diagnosis TEXT,room_bed TEXT,treatment TEXT,observations TEXT,discharge_datetime TEXT,final_diagnosis TEXT,recommendations TEXT,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(doctor_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS hospitalization_observations(id INTEGER PRIMARY KEY,hospitalization_id INTEGER NOT NULL,observation_datetime TEXT NOT NULL,temperature REAL,blood_pressure TEXT,pulse REAL,weight REAL,patient_state TEXT,treatment TEXT,nurse_observation TEXT,recorded_by INTEGER,FOREIGN KEY(hospitalization_id) REFERENCES hospitalizations(id));
+ CREATE TABLE IF NOT EXISTS medicine_categories(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL);
+ CREATE TABLE IF NOT EXISTS suppliers(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,phone TEXT,address TEXT,contact_person TEXT);
+ CREATE TABLE IF NOT EXISTS medicines(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,form TEXT,dosage TEXT,category TEXT,supplier TEXT,purchase_price REAL NOT NULL DEFAULT 0,sale_price REAL NOT NULL DEFAULT 0,available_quantity REAL NOT NULL DEFAULT 0,minimum_threshold REAL NOT NULL DEFAULT 0,expiration_date TEXT,lot_number TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS stock_movements(id INTEGER PRIMARY KEY,medicine_id INTEGER NOT NULL,movement_type TEXT NOT NULL,quantity REAL NOT NULL,unit_price REAL,reference TEXT,user_id INTEGER NOT NULL,movement_date TEXT NOT NULL,FOREIGN KEY(medicine_id) REFERENCES medicines(id));
+ CREATE TABLE IF NOT EXISTS inventory(id INTEGER PRIMARY KEY,inventory_date TEXT NOT NULL,medicine_id INTEGER NOT NULL,theoretical_quantity REAL NOT NULL,counted_quantity REAL NOT NULL,difference REAL NOT NULL,user_id INTEGER NOT NULL,FOREIGN KEY(medicine_id) REFERENCES medicines(id));
+ CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY,patient_id INTEGER,invoice_number TEXT UNIQUE NOT NULL,reason TEXT NOT NULL,amount REAL NOT NULL,status TEXT NOT NULL DEFAULT 'À payer',created_at TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS payments(id INTEGER PRIMARY KEY,invoice_id INTEGER,patient_id INTEGER,amount REAL NOT NULL,payment_mode TEXT NOT NULL,reason TEXT,user_id INTEGER NOT NULL,payment_date TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY,reason TEXT NOT NULL,amount REAL NOT NULL,supplier TEXT,user_id INTEGER NOT NULL,expense_date TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS cash_transactions(id INTEGER PRIMARY KEY,transaction_type TEXT NOT NULL,amount REAL NOT NULL,reason TEXT NOT NULL,user_id INTEGER NOT NULL,transaction_date TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS discharges(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,hospitalization_id INTEGER,diagnosis TEXT,evolution TEXT,treatment TEXT,recommendations TEXT,discharge_date TEXT NOT NULL,user_id INTEGER,FOREIGN KEY(patient_id) REFERENCES patients(id),FOREIGN KEY(hospitalization_id) REFERENCES hospitalizations(id));
+ CREATE TABLE IF NOT EXISTS referrals(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,destination TEXT NOT NULL,reason TEXT,clinical_summary TEXT,recommendations TEXT,referral_date TEXT NOT NULL,user_id INTEGER,FOREIGN KEY(patient_id) REFERENCES patients(id));
+ CREATE TABLE IF NOT EXISTS follow_ups(id INTEGER PRIMARY KEY,patient_id INTEGER NOT NULL,care_type TEXT,observation TEXT,evolution TEXT,follow_up_date TEXT NOT NULL,user_id INTEGER,FOREIGN KEY(patient_id) REFERENCES patients(id));
+  ''')
+ else:
+  c=con()
+ for r in ROLES:c.execute('INSERT OR IGNORE INTO roles(name) VALUES(?)',(r,))
+ for name,module in [('patients.view','Réception'),('patients.manage','Réception'),('appointments.manage','Réception'),('triage.manage','Réception'),('consultations.manage','Consultation'),('hospitalizations.manage','Consultation'),('laboratory.manage','Consultation'),('pharmacy.manage','Pharmacie'),('accounting.manage','Comptabilité'),('reports.view','Administration'),('users.manage','Administration'),('audit.view','Administration')]: c.execute('INSERT OR IGNORE INTO permissions(name,module) VALUES(?,?)',(name,module))
+ permission_map={
+  'Administrateur':['patients.view','patients.manage','appointments.manage','triage.manage','consultations.manage','hospitalizations.manage','laboratory.manage','pharmacy.manage','accounting.manage','reports.view','users.manage','audit.view'],
+  'Réceptionniste':['patients.view','patients.manage','appointments.manage','triage.manage'],
+  'Médecin':['patients.view','consultations.manage','hospitalizations.manage','laboratory.manage','pharmacy.manage'],
+  'Infirmier':['patients.view','consultations.manage','hospitalizations.manage','laboratory.manage'],
+  'Pharmacien':['patients.view','pharmacy.manage'],
+  'Comptable':['accounting.manage'],
+  'Direction':['patients.view','appointments.manage','triage.manage','consultations.manage','hospitalizations.manage','laboratory.manage','pharmacy.manage','accounting.manage','reports.view']
+ }
+ for role,perms in permission_map.items():
+  rid=c.execute('SELECT id FROM roles WHERE name=?',(role,)).fetchone()['id']
+  for perm_name in perms:
+   perm=c.execute('SELECT id FROM permissions WHERE name=?',(perm_name,)).fetchone()
+   if perm: c.execute('INSERT OR IGNORE INTO role_permissions(role_id,permission_id) VALUES(?,?)',(rid,perm['id']))
+ if c.execute('SELECT COUNT(*) n FROM users').fetchone()['n']==0:
+  rid=c.execute("SELECT id FROM roles WHERE name='Administrateur'").fetchone()['id']; t=now()
+  c.execute('INSERT INTO users(username,password_hash,role_id,created_at,updated_at) VALUES(?,?,?,?,?)',('admin',generate_password_hash('ChangeMe-Admin-2026!'),rid,t,t))
+ c.commit(); c.close()
+init_db()
+
+def user():
+ if not session.get('uid'): return None
+ c=con(); u=c.execute('SELECT u.*,r.name role FROM users u JOIN roles r ON r.id=u.role_id WHERE u.id=?',(session['uid'],)).fetchone(); c.close(); return u
+def write_audit(action,module,result='SUCCÈS',typ=None,oid=None):
+ c=con(); c.execute('INSERT INTO audit_logs(user_id,action,module,date_time,object_type,object_id,result) VALUES(?,?,?,?,?,?,?)',(session.get('uid'),action,module,now(),typ,oid,result)); c.commit(); c.close()
+def csrf():
+ session.setdefault('csrf',secrets.token_urlsafe(32)); return session['csrf']
+@app.context_processor
+def ctx(): return {'user':user(),'csrf':csrf(),'app':APP}
+@app.before_request
+def guards():
+ if session.get('uid'):
+  if session.get('last') and datetime.now()-datetime.fromisoformat(session['last'])>timedelta(minutes=30): session.clear(); flash('Session expirée.','warning'); return redirect(url_for('login'))
+  session['last']=datetime.now().isoformat(timespec='seconds')
+  if not user(): session.clear(); return redirect(url_for('login'))
+ if request.method=='POST' and request.endpoint!='login' and request.form.get('_csrf')!=session.get('csrf'): abort(400)
+@app.after_request
+def headers(r): r.headers.update({'X-Content-Type-Options':'nosniff','X-Frame-Options':'SAMEORIGIN','Referrer-Policy':'strict-origin-when-cross-origin','Cache-Control':'no-store'}); return r
+def roles(*allowed):
+ def deco(f):
+  @wraps(f)
+  def w(*a,**k):
+   u=user()
+   if not u:return redirect(url_for('login'))
+   if u['role'] not in allowed:write_audit('ACCÈS REFUSÉ',request.endpoint,'REFUS');abort(403)
+   return f(*a,**k)
+  return w
+ return deco
+
+def page(title,body,**data):
+ shell='''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} — {{app}}</title><style>body{font-family:Arial;margin:0;background:#f4f6f8;color:#20252b}header{background:#123b5d;color:#fff;padding:14px 22px;display:flex;justify-content:space-between}nav{background:#173f61;padding:8px 14px;display:flex;gap:6px;flex-wrap:wrap}nav a{color:#fff;text-decoration:none;background:#245579;padding:7px 9px;border-radius:4px;font-size:13px}main{max-width:1280px;margin:20px auto;padding:0 14px}.card{background:#fff;padding:16px;border:1px solid #dce2e7;border-radius:7px;margin-bottom:15px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}label{display:block;font-weight:bold;margin:5px 0}input,select,textarea{width:100%;box-sizing:border-box;padding:8px;border:1px solid #cbd3da;border-radius:4px}textarea{min-height:75px}button,.btn{background:#145a86;color:#fff;border:0;border-radius:4px;padding:9px 13px;text-decoration:none;cursor:pointer}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:7px}th{background:#edf1f4}.stat{font-size:26px;font-weight:bold}.small{font-size:12px;color:#65717a}.alert{padding:9px;margin:8px 0;border-radius:4px;background:#e5edf4}.danger{background:#f7d5d5}.success{background:#dcefe0}.warning{background:#fff0bf}</style></head><body><header><div><b>{{app}}</b><div class="small" style="color:#dce8f0">Gestion médicale, administrative, pharmaceutique et comptable</div></div><div>{% if user %}{{user.username}} — {{user.role}}{% endif %}</div></header>{% if user %}<nav><a href="{{url_for('dashboard')}}">Tableau de bord</a>{% if user.role in ['Administrateur','Réceptionniste','Direction'] %}<a href="{{url_for('patients')}}">Patients</a><a href="{{url_for('appointments')}}">Rendez-vous</a><a href="{{url_for('triage')}}">Triage</a>{% endif %}{% if user.role in ['Administrateur','Médecin','Infirmier','Direction'] %}<a href="{{url_for('consultations')}}">Consultation</a><a href="{{url_for('hospitalizations')}}">Hospitalisation</a><a href="{{url_for('hospitalization_observations')}}">Suivi hospitalier</a><a href="{{url_for('laboratory')}}">Laboratoire</a><a href="{{url_for('prescriptions')}}">Prescriptions</a><a href="{{url_for('medical_forms')}}">Formulaires médicaux</a>{% endif %}{% if user.role in ['Administrateur','Pharmacien','Médecin','Direction'] %}<a href="{{url_for('pharmacy')}}">Pharmacie</a><a href="{{url_for('inventory')}}">Inventaire</a>{% endif %}{% if user.role in ['Administrateur','Comptable','Direction'] %}<a href="{{url_for('accounting')}}">Comptabilité</a>{% endif %}{% if user.role in ['Administrateur','Direction'] %}<a href="{{url_for('reports')}}">Rapports</a>{% endif %}{% if user.role=='Administrateur' %}<a href="{{url_for('administration')}}">Administration</a><a href="{{url_for('audit')}}">Audit</a><a href="{{url_for('backup')}}">Sauvegarde</a>{% endif %}<a href="{{url_for('logout')}}">Déconnexion</a></nav>{% endif %}<main>{% with ms=get_flashed_messages(with_categories=true) %}{% for c,m in ms %}<div class="alert {{c}}">{{m}}</div>{% endfor %}{% endwith %}'''+body+'</main></body></html>'
+ return render_template_string(shell,title=title,**data)
+
+LOGIN='''<div class="card" style="max-width:420px;margin:70px auto"><h2>Connexion sécurisée</h2><form method="post"><label>Nom d'utilisateur</label><input name="username" required><label>Mot de passe</label><input name="password" type="password" required><input type="hidden" name="_csrf" value="{{csrf}}"><br><button>Se connecter</button></form><p class="small">Compte initial : admin / ChangeMe-Admin-2026! — à changer avant usage réel.</p></div>'''
+@app.route('/login',methods=['GET','POST'])
+def login():
+ if request.method=='POST':
+  c=con(); u=c.execute('SELECT u.*,r.name role FROM users u JOIN roles r ON r.id=u.role_id WHERE username=?',(request.form.get('username','').strip(),)).fetchone()
+  if not u: c.close(); flash('Identifiants invalides.','danger'); return render_template_string(LOGIN)
+  if not u['is_active']: c.close(); flash('Compte désactivé.','danger'); return render_template_string(LOGIN)
+  if u['locked_until'] and datetime.now()<datetime.fromisoformat(u['locked_until']): c.close(); flash('Compte temporairement verrouillé.','danger'); return render_template_string(LOGIN)
+  if not check_password_hash(u['password_hash'],request.form.get('password','')):
+   n=u['failed_attempts']+1; lock=(datetime.now()+timedelta(minutes=10)).isoformat(timespec='seconds') if n>=5 else None; n=0 if lock else n;c.execute('UPDATE users SET failed_attempts=?,locked_until=? WHERE id=?',(n,lock,u['id']));c.commit();c.close();flash('Identifiants invalides.','danger');return render_template_string(LOGIN)
+  c.execute('UPDATE users SET failed_attempts=0,locked_until=NULL,updated_at=? WHERE id=?',(now(),u['id']));c.commit();c.close();session.clear();session.permanent=True;session['uid']=u['id'];session['last']=datetime.now().isoformat(timespec='seconds');session['csrf']=secrets.token_urlsafe(32);write_audit('CONNEXION','AUTHENTIFICATION');return redirect(url_for('dashboard'))
+ return render_template_string(LOGIN)
+@app.route('/logout')
+def logout():
+ if user():write_audit('DÉCONNEXION','AUTHENTIFICATION')
+ session.clear();return redirect(url_for('login'))
+@app.route('/')
+def index():return redirect(url_for('dashboard') if user() else url_for('login'))
+@app.route('/dashboard')
+@roles(*ROLES)
+def dashboard():
+ c=con(); s={'patients':c.execute('SELECT COUNT(*) FROM patients').fetchone()[0],'consultations':c.execute("SELECT COUNT(*) FROM consultations WHERE consultation_date=date('now')").fetchone()[0],'hospitalisations':c.execute('SELECT COUNT(*) FROM hospitalizations WHERE discharge_datetime IS NULL').fetchone()[0],'rendez_vous':c.execute("SELECT COUNT(*) FROM appointments WHERE appointment_date=date('now')").fetchone()[0],'revenus_jour':c.execute("SELECT COALESCE(SUM(amount),0) FROM payments WHERE date(payment_date)=date('now')").fetchone()[0],'depenses_jour':c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date(expense_date)=date('now')").fetchone()[0],'stocks_faibles':c.execute('SELECT COUNT(*) FROM medicines WHERE available_quantity<=minimum_threshold').fetchone()[0]};c.close()
+ body='''<h1>Tableau de bord</h1><div class="grid">{% for k,v in stats.items() %}<div class="card"><div class="small">{{k.replace('_',' ')|upper}}</div><div class="stat">{{v}}</div></div>{% endfor %}</div>''';return page('Tableau de bord',body,stats=s)
+
+@app.route('/patients',methods=['GET','POST'])
+@roles('Administrateur','Réceptionniste','Direction')
+def patients():
+ c=con()
+ if request.method=='POST':
+  try:
+   t=now()
+
+   # Génération automatique du numéro patient
+   last=c.execute(
+    "SELECT patient_number FROM patients WHERE patient_number LIKE ? ORDER BY id DESC LIMIT 1",
+    ('PAT%',)
+   ).fetchone()
+
+   if last and last['patient_number']:
+    try:
+     num=int(last['patient_number'].replace('PAT',''))
+    except ValueError:
+     num=0
+   else:
+    num=0
+
+   patient_number=f'PAT{num+1:06d}'
+
+   cur=c.execute(
+    'INSERT INTO patients(patient_number,last_name,post_name,first_name,sex,birth_date,birth_place,address,phone,profession,admin_info,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+    (
+     patient_number,
+     request.form['last_name'],
+     request.form.get('post_name'),
+     request.form['first_name'],
+     request.form['sex'],
+     request.form.get('birth_date') or None,
+     request.form.get('birth_place'),
+     request.form.get('address'),
+     request.form.get('phone'),
+     request.form.get('profession'),
+     request.form.get('admin_info'),
+     t,
+     t
+    )
+   )
+
+   pid=cur.lastrowid
+
+   c.execute(
+    'INSERT INTO medical_records(patient_id,created_at,updated_at) VALUES(?,?,?)',
+    (pid,t,t)
+   )
+
+   c.commit()
+   write_audit('CRÉATION PATIENT','RÉCEPTION','SUCCÈS','patients',pid)
+   flash(f'Patient {patient_number} enregistré.','success')
+
+  except (sqlite3.IntegrityError, PGIntegrityError):
+   c.rollback()
+   flash('Impossible d’enregistrer le patient. Vérifiez les données saisies.','danger')
+
+ rows=c.execute(
+  'SELECT * FROM patients ORDER BY id DESC LIMIT 200'
+ ).fetchall()
+
+ c.close()
+
+ body='''<h1>Patients</h1>
+<div class="card">
+<form method="post">
+<input type="hidden" name="_csrf" value="{{csrf}}">
+<div class="formgrid">
+
+<div>
+<label>N° patient</label>
+<input value="Généré automatiquement" readonly>
+</div>
+
+<div>
+<label>Nom</label>
+<input name="last_name" required>
+</div>
+
+<div>
+<label>Post-nom</label>
+<input name="post_name">
+</div>
+
+<div>
+<label>Prénom</label>
+<input name="first_name" required>
+</div>
+
+<div>
+<label>Sexe</label>
+<select name="sex" required>
+<option value="">Sélectionner</option>
+<option value="F">F</option>
+<option value="M">M</option>
+</select>
+</div>
+
+<div>
+<label>Date de naissance</label>
+<input name="birth_date" type="date">
+</div>
+
+<div>
+<label>Lieu de naissance</label>
+<input name="birth_place">
+</div>
+
+<div>
+<label>Adresse</label>
+<input name="address">
+</div>
+
+<div>
+<label>Téléphone</label>
+<input name="phone">
+</div>
+
+<div>
+<label>Profession</label>
+<input name="profession">
+</div>
+
+<div>
+<label>Informations administratives nécessaires</label>
+<input name="admin_info">
+</div>
+
+</div>
+<br>
+<button>Enregistrer le patient</button>
+</form>
+</div>
+
+<div class="card">
+<table>
+<tr>
+<th>N°</th>
+<th>Identité</th>
+<th>Sexe</th>
+<th>Naissance</th>
+<th>Téléphone</th>
+</tr>
+
+{% for p in rows %}
+<tr>
+<td>{{p.patient_number}}</td>
+<td>{{p.last_name}} {{p.post_name or ''}} {{p.first_name}}</td>
+<td>{{p.sex}}</td>
+<td>{{p.birth_date or ''}}</td>
+<td>{{p.phone or ''}}</td>
+</tr>
+{% endfor %}
+
+</table>
+</div>'''
+
+ return page('Patients',body,rows=rows)
+
+@app.route('/appointments',methods=['GET','POST'])
+@roles('Administrateur','Réceptionniste','Direction')
+def appointments():
+ c=con()
+ if request.method=='POST':
+  cur=c.execute('INSERT INTO appointments(patient_id,doctor_id,service,appointment_date,appointment_time,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)',(request.form['patient_id'],request.form.get('doctor_id') or None,request.form.get('service'),request.form['appointment_date'],request.form['appointment_time'],request.form.get('reason'),now(),now()));c.commit();write_audit('CRÉATION RENDEZ-VOUS','RÉCEPTION','SUCCÈS','appointments',cur.lastrowid);flash('Rendez-vous enregistré.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();docs=c.execute("SELECT u.id,u.username FROM users u JOIN roles r ON r.id=u.role_id WHERE r.name='Médecin' AND u.is_active=TRUE").fetchall();rows=c.execute('SELECT a.*,p.patient_number,p.last_name,p.first_name,u.username doctor FROM appointments a JOIN patients p ON p.id=a.patient_id LEFT JOIN users u ON u.id=a.doctor_id ORDER BY a.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Rendez-vous</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Patient</label><select name="patient_id" required>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Médecin</label><select name="doctor_id"><option value="">Non précisé</option>{% for d in docs %}<option value="{{d.id}}">{{d.username}}</option>{% endfor %}</select></div><div><label>Service</label><input name="service"></div><div><label>Date</label><input name="appointment_date" type="date" required></div><div><label>Heure</label><input name="appointment_time" type="time" required></div><div><label>Motif</label><input name="reason"></div></div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Patient</th><th>Médecin</th><th>Service</th><th>Motif</th><th>Statut</th></tr>{% for a in rows %}<tr><td>{{a.appointment_date}} {{a.appointment_time}}</td><td>{{a.patient_number}} — {{a.last_name}} {{a.first_name}}</td><td>{{a.doctor or ''}}</td><td>{{a.service or ''}}</td><td>{{a.reason or ''}}</td><td>{{a.status}}</td></tr>{% endfor %}</table></div>'''
+ return page('Rendez-vous',body,pats=pats,docs=docs,rows=rows)
+
+@app.route('/triage',methods=['GET','POST'])
+@roles('Administrateur','Réceptionniste','Infirmier','Médecin','Direction')
+def triage():
+ c=con()
+ if request.method=='POST':
+  h=request.form.get('height');w=request.form.get('weight');bmi=round(float(w)/((float(h)/100)**2),2) if h and w and float(h)>0 else None
+  cur=c.execute('INSERT INTO triage_records(patient_id,temperature,weight,blood_pressure,heart_rate,respiratory_rate,oxygen_saturation,height,bmi,pain_scale,observation,recorded_by,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['patient_id'],request.form.get('temperature') or None,w,request.form.get('blood_pressure'),request.form.get('heart_rate') or None,request.form.get('respiratory_rate') or None,request.form.get('oxygen_saturation') or None,h,bmi,request.form.get('pain_scale') or None,request.form.get('observation'),session['uid'],now()));c.commit();write_audit('ENREGISTREMENT TRIAGE','TRIAGE','SUCCÈS','triage_records',cur.lastrowid);flash('Triage enregistré.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();rows=c.execute('SELECT t.*,p.patient_number,p.last_name,p.first_name FROM triage_records t JOIN patients p ON p.id=t.patient_id ORDER BY t.id DESC LIMIT 200').fetchall();c.close()
+ fields=''.join(f'<div><label>{lab}</label><input name="{n}" {"type=number step=0.1" if n in ["temperature","weight","height","oxygen_saturation"] else "type=number" if n in ["heart_rate","respiratory_rate","pain_scale"] else ""}></div>' for n,lab in [('temperature','Température'),('weight','Poids'),('blood_pressure','Tension artérielle'),('heart_rate','Fréquence cardiaque'),('respiratory_rate','Fréquence respiratoire'),('oxygen_saturation','SpO₂'),('height','Taille (cm)'),('pain_scale','Échelle douleur'),('observation','Observation')])
+ body=f'''<h1>Triage</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{{{csrf}}}}"><div class="formgrid"><div><label>Patient</label><select name="patient_id" required>{{% for p in pats %}}<option value="{{{{p.id}}}}">{{{{p.patient_number}}}} — {{{{p.last_name}}}} {{{{p.first_name}}}}</option>{{% endfor %}}</select></div>{fields}</div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Patient</th><th>T°</th><th>TA</th><th>FC</th><th>FR</th><th>SpO₂</th><th>IMC</th><th>Douleur</th></tr>{{% for t in rows %}}<tr><td>{{{{t.recorded_at}}}}</td><td>{{{{t.patient_number}}}} — {{{{t.last_name}}}} {{{{t.first_name}}}}</td><td>{{{{t.temperature or ''}}}}</td><td>{{{{t.blood_pressure or ''}}}}</td><td>{{{{t.heart_rate or ''}}}}</td><td>{{{{t.respiratory_rate or ''}}}}</td><td>{{{{t.oxygen_saturation or ''}}}}</td><td>{{{{t.bmi or ''}}}}</td><td>{{{{t.pain_scale or ''}}}}</td></tr>{{% endfor %}}</table></div>'''
+ return page('Triage',body,pats=pats,rows=rows)
+
+@app.route('/consultations',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Infirmier','Direction')
+def consultations():
+ c=con()
+ if request.method=='POST':
+  pid=int(request.form['patient_id']);mr=c.execute('SELECT id FROM medical_records WHERE patient_id=?',(pid,)).fetchone()
+  if not mr:c.execute('INSERT INTO medical_records(patient_id,created_at,updated_at) VALUES(?,?,?)',(pid,now(),now()));mr=c.execute('SELECT id FROM medical_records WHERE patient_id=?',(pid,)).fetchone()
+  vals=[pid,mr['id'],session['uid'],request.form['consultation_date']]+[request.form.get(x) or None for x in ['complaint','history','temperature','weight','blood_pressure','heart_rate','respiratory_rate','oxygen_saturation','clinical_exam','primary_diagnosis','secondary_diagnosis','hypotheses','treatment','advice','next_appointment','referral']]+[1 if request.form.get('hospitalization_needed') else 0,now()]
+  cur=c.execute('INSERT INTO consultations(patient_id,medical_record_id,doctor_id,consultation_date,complaint,history,temperature,weight,blood_pressure,heart_rate,respiratory_rate,oxygen_saturation,clinical_exam,primary_diagnosis,secondary_diagnosis,hypotheses,treatment,advice,next_appointment,referral,hospitalization_needed,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals);c.execute('UPDATE medical_records SET updated_at=? WHERE id=?',(now(),mr['id']));c.commit();write_audit('CRÉATION CONSULTATION','CONSULTATION','SUCCÈS','consultations',cur.lastrowid);flash('Consultation enregistrée.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();rows=c.execute('SELECT c.*,p.patient_number,p.last_name,p.first_name,u.username FROM consultations c JOIN patients p ON p.id=c.patient_id JOIN users u ON u.id=c.doctor_id ORDER BY c.id DESC LIMIT 200').fetchall();c.close()
+ def inp(n,l,ta=False):return f'<div><label>{l}</label><{"textarea" if ta else "input"} name="{n}"></{"textarea" if ta else "div"}>' if ta else f'<div><label>{l}</label><input name="{n}"></div>'
+ body='''<h1>Consultations</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Patient</label><select name="patient_id" required>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Date</label><input name="consultation_date" type="date" required></div><div><label>Motif / plainte</label><textarea name="complaint"></textarea></div><div><label>Histoire</label><textarea name="history"></textarea></div><div><label>Examen clinique</label><textarea name="clinical_exam"></textarea></div><div><label>Diagnostic principal</label><textarea name="primary_diagnosis"></textarea></div><div><label>Diagnostic secondaire</label><textarea name="secondary_diagnosis"></textarea></div><div><label>Hypothèses</label><textarea name="hypotheses"></textarea></div><div><label>Traitement</label><textarea name="treatment"></textarea></div><div><label>Conseils</label><textarea name="advice"></textarea></div><div><label>Prochain rendez-vous</label><input name="next_appointment" type="date"></div><div><label>Référence</label><input name="referral"></div><div><label>Température</label><input name="temperature" type="number" step="0.1"></div><div><label>Poids</label><input name="weight" type="number" step="0.1"></div><div><label>TA</label><input name="blood_pressure"></div><div><label>FC</label><input name="heart_rate" type="number"></div><div><label>FR</label><input name="respiratory_rate" type="number"></div><div><label>SpO₂</label><input name="oxygen_saturation" type="number"></div></div><label><input type="checkbox" name="hospitalization_needed" style="width:auto"> Hospitalisation nécessaire</label><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Patient</th><th>Médecin</th><th>Diagnostic</th><th>Hospitalisation</th></tr>{% for c in rows %}<tr><td>{{c.consultation_date}}</td><td>{{c.patient_number}} — {{c.last_name}} {{c.first_name}}</td><td>{{c.username}}</td><td>{{c.primary_diagnosis or ''}}</td><td>{{'Oui' if c.hospitalization_needed else 'Non'}}</td></tr>{% endfor %}</table></div>'''
+ return page('Consultations',body,pats=pats,rows=rows)
+
+@app.route('/hospitalizations',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Infirmier','Direction')
+def hospitalizations():
+ c=con()
+ if request.method=='POST':
+  num=request.form.get('hospitalization_number') or 'H-'+datetime.now().strftime('%Y%m%d%H%M%S');cur=c.execute('INSERT INTO hospitalizations(hospitalization_number,patient_id,doctor_id,service,entry_datetime,reason,diagnosis,room_bed,treatment,observations) VALUES(?,?,?,?,?,?,?,?,?,?)',(num,request.form['patient_id'],session['uid'],request.form.get('service'),request.form.get('entry_datetime') or now(),request.form.get('reason'),request.form.get('diagnosis'),request.form.get('room_bed'),request.form.get('treatment'),request.form.get('observations')));c.commit();write_audit('CRÉATION HOSPITALISATION','HOSPITALISATION','SUCCÈS','hospitalizations',cur.lastrowid);flash('Hospitalisation enregistrée.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();rows=c.execute('SELECT h.*,p.patient_number,p.last_name,p.first_name FROM hospitalizations h JOIN patients p ON p.id=h.patient_id ORDER BY h.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Hospitalisation</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>N° hospitalisation</label><input name="hospitalization_number"></div><div><label>Patient</label><select name="patient_id">{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Service</label><input name="service"></div><div><label>Entrée</label><input name="entry_datetime" type="datetime-local"></div><div><label>Motif</label><input name="reason"></div><div><label>Diagnostic</label><input name="diagnosis"></div><div><label>Chambre/lit</label><input name="room_bed"></div><div><label>Traitement</label><textarea name="treatment"></textarea></div><div><label>Observations</label><textarea name="observations"></textarea></div></div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>N°</th><th>Patient</th><th>Service</th><th>Entrée</th><th>Chambre/lit</th><th>Diagnostic</th><th>Sortie</th></tr>{% for h in rows %}<tr><td>{{h.hospitalization_number}}</td><td>{{h.patient_number}} — {{h.last_name}} {{h.first_name}}</td><td>{{h.service or ''}}</td><td>{{h.entry_datetime}}</td><td>{{h.room_bed or ''}}</td><td>{{h.diagnosis or ''}}</td><td>{{h.discharge_datetime or 'En cours'}}</td></tr>{% endfor %}</table></div>'''
+ return page('Hospitalisation',body,pats=pats,rows=rows)
+
+@app.route('/laboratory',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Infirmier','Direction')
+def laboratory():
+ c=con()
+ if request.method=='POST':
+  cur=c.execute('INSERT INTO laboratory_requests(patient_id,prescriber_id,exam_requested,sample,request_date) VALUES(?,?,?,?,?)',(request.form['patient_id'],session['uid'],request.form['exam_requested'],request.form.get('sample'),request.form.get('request_date') or now()));c.commit();write_audit('DEMANDE LABORATOIRE','LABORATOIRE','SUCCÈS','laboratory_requests',cur.lastrowid);flash('Demande de laboratoire enregistrée.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();rows=c.execute('SELECT l.*,p.patient_number,p.last_name,p.first_name FROM laboratory_requests l JOIN patients p ON p.id=l.patient_id ORDER BY l.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Laboratoire</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Patient</label><select name="patient_id">{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Examen demandé</label><input name="exam_requested" required></div><div><label>Prélèvement</label><input name="sample"></div><div><label>Date demande</label><input name="request_date"></div><div><label>Date résultat</label><input name="result_date"></div><div><label>Résultat</label><textarea name="result"></textarea></div><div><label>Conclusion</label><textarea name="conclusion"></textarea></div></div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Patient</th><th>Examen</th><th>Résultat</th><th>Conclusion</th></tr>{% for l in rows %}<tr><td>{{l.request_date}}</td><td>{{l.patient_number}} — {{l.last_name}} {{l.first_name}}</td><td>{{l.exam_requested}}</td><td>{{l.result or ''}}</td><td>{{l.conclusion or ''}}</td></tr>{% endfor %}</table></div>'''
+ return page('Laboratoire',body,pats=pats,rows=rows)
+
+@app.route('/pharmacy',methods=['GET','POST'])
+@roles('Administrateur','Pharmacien','Médecin','Direction')
+def pharmacy():
+ c=con()
+ if request.method=='POST':
+  if request.form['action']=='medicine':
+   try:
+    cur=c.execute('INSERT INTO medicines(code,name,form,dosage,category,supplier,purchase_price,sale_price,available_quantity,minimum_threshold,expiration_date,lot_number,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(request.form['code'],request.form['name'],request.form.get('form'),request.form.get('dosage'),request.form.get('category'),request.form.get('supplier'),float(request.form.get('purchase_price') or 0),float(request.form.get('sale_price') or 0),float(request.form.get('quantity') or 0),float(request.form.get('minimum_threshold') or 0),request.form.get('expiration_date'),request.form.get('lot_number'),now(),now()));c.commit();write_audit('CRÉATION MÉDICAMENT','PHARMACIE','SUCCÈS','medicines',cur.lastrowid);flash('Médicament enregistré.','success')
+   except (sqlite3.IntegrityError, PGIntegrityError):c.rollback();flash('Code médicament déjà utilisé.','danger')
+  else:
+   mid=int(request.form['medicine_id']);q=float(request.form['quantity']);typ=request.form['movement_type'];m=c.execute('SELECT * FROM medicines WHERE id=?',(mid,)).fetchone()
+   if q<=0 or (typ!='Entrée' and m['available_quantity']<q):flash('Mouvement invalide ou stock insuffisant.','danger')
+   else:
+    c.execute('UPDATE medicines SET available_quantity=available_quantity+?,updated_at=? WHERE id=?',(q if typ=='Entrée' else -q,now(),mid));cur=c.execute('INSERT INTO stock_movements(medicine_id,movement_type,quantity,unit_price,reference,user_id,movement_date) VALUES(?,?,?,?,?,?,?)',(mid,typ,q,m['purchase_price'] if typ=='Entrée' else m['sale_price'],request.form.get('reference'),session['uid'],now()));c.commit();write_audit('MOUVEMENT STOCK','PHARMACIE','SUCCÈS','stock_movements',cur.lastrowid);flash('Mouvement enregistré.','success')
+ meds=c.execute('SELECT * FROM medicines ORDER BY name').fetchall();moves=c.execute('SELECT s.*,m.code,m.name FROM stock_movements s JOIN medicines m ON m.id=s.medicine_id ORDER BY s.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Pharmacie</h1><div class="card"><h3>Alertes de stock et péremption</h3>{% for m in meds %}{% if m.available_quantity<=m.minimum_threshold %}<div class="alert danger">Stock faible/rupture : {{m.code}} — {{m.name}} ({{m.available_quantity}})</div>{% endif %}{% if m.expiration_date and m.expiration_date < today %}<div class="alert danger">Produit expiré : {{m.code}} — {{m.name}} ({{m.expiration_date}})</div>{% endif %}{% endfor %}</div><div class="card"><h3>Médicament</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="medicine"><div class="formgrid"><div><label>Code</label><input name="code" required></div><div><label>Nom</label><input name="name" required></div><div><label>Forme</label><input name="form"></div><div><label>Dosage</label><input name="dosage"></div><div><label>Catégorie</label><input name="category"></div><div><label>Fournisseur</label><input name="supplier"></div><div><label>Prix achat</label><input name="purchase_price" type="number" step="0.01"></div><div><label>Prix vente</label><input name="sale_price" type="number" step="0.01"></div><div><label>Quantité</label><input name="quantity" type="number" step="0.01"></div><div><label>Seuil minimum</label><input name="minimum_threshold" type="number" step="0.01"></div><div><label>Expiration</label><input name="expiration_date" type="date"></div><div><label>Lot</label><input name="lot_number"></div></div><br><button>Enregistrer</button></form></div><div class="card"><h3>Entrée / sortie / délivrance</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="movement"><div class="formgrid"><div><label>Médicament</label><select name="medicine_id">{% for m in meds %}<option value="{{m.id}}">{{m.code}} — {{m.name}} ({{m.available_quantity}})</option>{% endfor %}</select></div><div><label>Type</label><select name="movement_type"><option>Entrée</option><option>Sortie</option><option>Délivrance</option></select></div><div><label>Quantité</label><input name="quantity" type="number" min="0.01" step="0.01"></div><div><label>Référence</label><input name="reference"></div></div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Code</th><th>Médicament</th><th>Stock</th><th>Seuil</th><th>Expiration</th><th>Lot</th></tr>{% for m in meds %}<tr><td>{{m.code}}</td><td>{{m.name}}</td><td>{{m.available_quantity}}</td><td>{{m.minimum_threshold}}</td><td>{{m.expiration_date or ''}}</td><td>{{m.lot_number or ''}}</td></tr>{% endfor %}</table></div>'''
+ return page('Pharmacie',body,meds=meds,moves=moves,today=datetime.now().strftime('%Y-%m-%d'))
+
+
+@app.route('/hospitalization-observations',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Infirmier','Direction')
+def hospitalization_observations():
+ c=con()
+ if request.method=='POST':
+  cur=c.execute('INSERT INTO hospitalization_observations(hospitalization_id,observation_datetime,temperature,blood_pressure,pulse,weight,patient_state,treatment,nurse_observation,recorded_by) VALUES(?,?,?,?,?,?,?,?,?,?)',(request.form['hospitalization_id'],request.form.get('observation_datetime') or now(),float(request.form['temperature']) if request.form.get('temperature') else None,request.form.get('blood_pressure'),float(request.form['pulse']) if request.form.get('pulse') else None,float(request.form['weight']) if request.form.get('weight') else None,request.form.get('patient_state'),request.form.get('treatment'),request.form.get('nurse_observation'),session['uid']));c.commit();write_audit('SUIVI HOSPITALISATION','HOSPITALISATION','SUCCÈS','hospitalization_observations',cur.lastrowid);flash('Observation enregistrée.','success')
+ hs=c.execute("SELECT h.id,h.hospitalization_number,p.patient_number,p.last_name,p.first_name FROM hospitalizations h JOIN patients p ON p.id=h.patient_id WHERE h.discharge_datetime IS NULL ORDER BY h.id DESC").fetchall();rows=c.execute('SELECT o.*,h.hospitalization_number,p.patient_number,p.last_name,p.first_name FROM hospitalization_observations o JOIN hospitalizations h ON h.id=o.hospitalization_id JOIN patients p ON p.id=h.patient_id ORDER BY o.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Suivi quotidien d'hospitalisation</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Hospitalisation</label><select name="hospitalization_id" required>{% for h in hs %}<option value="{{h.id}}">{{h.hospitalization_number}} — {{h.patient_number}} {{h.last_name}} {{h.first_name}}</option>{% endfor %}</select></div><div><label>Date/heure</label><input name="observation_datetime" type="datetime-local"></div><div><label>Température</label><input name="temperature" type="number" step="0.1"></div><div><label>TA</label><input name="blood_pressure"></div><div><label>Pouls</label><input name="pulse" type="number"></div><div><label>Poids</label><input name="weight" type="number" step="0.1"></div><div><label>État du patient</label><input name="patient_state"></div></div><label>Traitement</label><textarea name="treatment"></textarea><label>Observation infirmière/médicale</label><textarea name="nurse_observation"></textarea><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Hospitalisation</th><th>Patient</th><th>État</th><th>Observation</th></tr>{% for o in rows %}<tr><td>{{o.observation_datetime}}</td><td>{{o.hospitalization_number}}</td><td>{{o.patient_number}} — {{o.last_name}} {{o.first_name}}</td><td>{{o.patient_state or ''}}</td><td>{{o.nurse_observation or ''}}</td></tr>{% endfor %}</table></div>'''
+ return page('Suivi hospitalisation',body,hs=hs,rows=rows)
+
+@app.route('/prescriptions',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Direction')
+def prescriptions():
+ c=con()
+ if request.method=='POST':
+  cur=c.execute('INSERT INTO prescriptions(patient_id,consultation_id,prescribed_by,prescription_date,instructions) VALUES(?,?,?,?,?)',(request.form['patient_id'],request.form.get('consultation_id') or None,session['uid'],request.form.get('prescription_date') or now(),request.form.get('instructions')));pid=cur.lastrowid
+  c.execute('INSERT INTO prescription_items(prescription_id,medicine_id,medicine_name,dosage,frequency,duration,instructions) VALUES(?,?,?,?,?,?,?)',(pid,request.form.get('medicine_id') or None,request.form['medicine_name'],request.form.get('dosage'),request.form.get('frequency'),request.form.get('duration'),request.form.get('item_instructions')));c.commit();write_audit('CRÉATION PRESCRIPTION','CONSULTATION','SUCCÈS','prescriptions',pid);flash('Prescription enregistrée.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();meds=c.execute('SELECT id,name,dosage FROM medicines ORDER BY name').fetchall();rows=c.execute('SELECT p.*,pt.patient_number,pt.last_name,pt.first_name,u.username,pi.medicine_name,pi.dosage,pi.frequency,pi.duration FROM prescriptions p JOIN patients pt ON pt.id=p.patient_id JOIN users u ON u.id=p.prescribed_by LEFT JOIN prescription_items pi ON pi.prescription_id=p.id ORDER BY p.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Prescriptions</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Patient</label><select name="patient_id" required>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Médicament</label><select name="medicine_id"><option value="">Saisie libre</option>{% for m in meds %}<option value="{{m.id}}">{{m.name}} {{m.dosage or ''}}</option>{% endfor %}</select></div><div><label>Nom du médicament</label><input name="medicine_name" required></div><div><label>Dosage</label><input name="dosage"></div><div><label>Fréquence / posologie</label><input name="frequency"></div><div><label>Durée</label><input name="duration"></div><div><label>Date</label><input name="prescription_date" type="date"></div></div><label>Instructions</label><textarea name="item_instructions"></textarea><label>Instructions générales</label><textarea name="instructions"></textarea><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Patient</th><th>Médicament</th><th>Dosage</th><th>Posologie</th><th>Durée</th></tr>{% for r in rows %}<tr><td>{{r.prescription_date}}</td><td>{{r.patient_number}} — {{r.last_name}} {{r.first_name}}</td><td>{{r.medicine_name}}</td><td>{{r.dosage or ''}}</td><td>{{r.frequency or ''}}</td><td>{{r.duration or ''}}</td></tr>{% endfor %}</table></div>'''
+ return page('Prescriptions',body,pats=pats,meds=meds,rows=rows)
+
+@app.route('/inventory',methods=['GET','POST'])
+@roles('Administrateur','Pharmacien','Direction')
+def inventory():
+ c=con()
+ if request.method=='POST':
+  mid=int(request.form['medicine_id']);m=c.execute('SELECT available_quantity FROM medicines WHERE id=?',(mid,)).fetchone();theo=float(m['available_quantity']);count=float(request.form['counted_quantity']);cur=c.execute('INSERT INTO inventory(inventory_date,medicine_id,theoretical_quantity,counted_quantity,difference,user_id) VALUES(?,?,?,?,?,?)',(request.form.get('inventory_date') or now(),mid,theo,count,count-theo,session['uid']));c.commit();write_audit('INVENTAIRE','PHARMACIE','SUCCÈS','inventory',cur.lastrowid);flash('Inventaire enregistré.','success')
+ meds=c.execute('SELECT id,code,name,available_quantity FROM medicines ORDER BY name').fetchall();rows=c.execute('SELECT i.*,m.code,m.name FROM inventory i JOIN medicines m ON m.id=i.medicine_id ORDER BY i.id DESC LIMIT 200').fetchall();c.close()
+ body='''<h1>Inventaire</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Médicament</label><select name="medicine_id" required>{% for m in meds %}<option value="{{m.id}}">{{m.code}} — {{m.name}} ({{m.available_quantity}})</option>{% endfor %}</select></div><div><label>Quantité comptée</label><input name="counted_quantity" type="number" step="0.01" required></div><div><label>Date</label><input name="inventory_date" type="datetime-local"></div></div><br><button>Enregistrer</button></form></div><div class="card"><table><tr><th>Date</th><th>Médicament</th><th>Théorique</th><th>Compté</th><th>Écart</th></tr>{% for r in rows %}<tr><td>{{r.inventory_date}}</td><td>{{r.code}} — {{r.name}}</td><td>{{r.theoretical_quantity}}</td><td>{{r.counted_quantity}}</td><td>{{r.difference}}</td></tr>{% endfor %}</table></div>'''
+ return page('Inventaire',body,meds=meds,rows=rows)
+
+
+@app.route('/medical-forms',methods=['GET','POST'])
+@roles('Administrateur','Médecin','Infirmier','Direction')
+def medical_forms():
+ c=con()
+ if request.method=='POST':
+  a=request.form['action']; pid=request.form['patient_id']
+  if a=='discharge':
+   cur=c.execute('INSERT INTO discharges(patient_id,hospitalization_id,diagnosis,evolution,treatment,recommendations,discharge_date,user_id) VALUES(?,?,?,?,?,?,?,?)',(pid,request.form.get('hospitalization_id') or None,request.form.get('diagnosis'),request.form.get('evolution'),request.form.get('treatment'),request.form.get('recommendations'),request.form.get('discharge_date') or now(),session['uid']))
+   if request.form.get('hospitalization_id'): c.execute('UPDATE hospitalizations SET discharge_datetime=?,final_diagnosis=?,recommendations=? WHERE id=?',(request.form.get('discharge_date') or now(),request.form.get('diagnosis'),request.form.get('recommendations'),request.form['hospitalization_id']))
+  elif a=='referral': cur=c.execute('INSERT INTO referrals(patient_id,destination,reason,clinical_summary,recommendations,referral_date,user_id) VALUES(?,?,?,?,?,?,?)',(pid,request.form['destination'],request.form.get('reason'),request.form.get('clinical_summary'),request.form.get('recommendations'),request.form.get('referral_date') or now(),session['uid']))
+  else: cur=c.execute('INSERT INTO follow_ups(patient_id,care_type,observation,evolution,follow_up_date,user_id) VALUES(?,?,?,?,?,?)',(pid,request.form.get('care_type'),request.form.get('observation'),request.form.get('evolution'),request.form.get('follow_up_date') or now(),session['uid']))
+  c.commit(); write_audit('FORMULAIRE MEDICAL','CONSULTATION','SUCCÈS',a,cur.lastrowid); flash('Formulaire enregistré.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall(); hs=c.execute('SELECT id,hospitalization_number,patient_id FROM hospitalizations WHERE discharge_datetime IS NULL ORDER BY id DESC').fetchall(); c.close()
+ body='''<h1>Autres formulaires médicaux</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="formgrid"><div><label>Type</label><select name="action"><option value="discharge">Sortie / discharge</option><option value="referral">Référence</option><option value="follow_up">Suivi</option></select></div><div><label>Patient</label><select name="patient_id" required>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>Hospitalisation (sortie)</label><select name="hospitalization_id"><option value="">Aucune</option>{% for h in hs %}<option value="{{h.id}}">{{h.hospitalization_number}}</option>{% endfor %}</select></div><div><label>Destination (référence)</label><input name="destination"></div><div><label>Type de prise en charge (suivi)</label><input name="care_type"></div><div><label>Date</label><input name="discharge_date" type="datetime-local"></div></div><label>Diagnostic</label><textarea name="diagnosis"></textarea><label>Évolution / observation</label><textarea name="evolution"></textarea><label>Résumé clinique / observation</label><textarea name="clinical_summary"></textarea><label>Traitement</label><textarea name="treatment"></textarea><label>Motif</label><textarea name="reason"></textarea><label>Recommandations</label><textarea name="recommendations"></textarea><label>Observation de suivi</label><textarea name="observation"></textarea><br><button>Enregistrer</button></form></div>'''
+ return page('Formulaires médicaux',body,pats=pats,hs=hs)
+
+@app.route('/backup')
+@roles('Administrateur')
+def backup():
+ import shutil
+ target=BASE/f"backup_clinique_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+ 
+ if is_postgres():
+  flash('En production PostgreSQL, utilisez le script pg_dump fourni dans la livraison pour les sauvegardes.', 'warning'); return redirect(url_for('administration'))
+ src=con(); dest=sqlite3.connect(target); src.backup(dest); dest.close(); src.close(); write_audit('SAUVEGARDE BASE','ADMINISTRATION','SUCCÈS','database',None); return send_file(target,as_attachment=True,download_name=target.name)
+
+@app.route('/accounting',methods=['GET','POST'])
+@roles('Administrateur','Comptable','Direction')
+def accounting():
+ c=con()
+ if request.method=='POST':
+  a=request.form['action']
+  if a=='invoice':
+   n=request.form.get('invoice_number') or 'FAC-'+datetime.now().strftime('%Y%m%d%H%M%S');cur=c.execute('INSERT INTO invoices(patient_id,invoice_number,reason,amount,status,created_at) VALUES(?,?,?,?,?,?)',(request.form.get('patient_id') or None,n,request.form['reason'],float(request.form['amount']),request.form.get('status') or 'À payer',now()));c.commit();write_audit('CRÉATION FACTURE','COMPTABILITÉ','SUCCÈS','invoices',cur.lastrowid);flash('Facture enregistrée.','success')
+  elif a=='payment':
+   cur=c.execute('INSERT INTO payments(invoice_id,patient_id,amount,payment_mode,reason,user_id,payment_date) VALUES(?,?,?,?,?,?,?)',(request.form.get('invoice_id') or None,request.form.get('patient_id') or None,float(request.form['amount']),request.form['payment_mode'],request.form.get('reason'),session['uid'],now()));c.commit();write_audit('PAIEMENT','COMPTABILITÉ','SUCCÈS','payments',cur.lastrowid);flash('Paiement enregistré.','success')
+  elif a=='cash_close':
+   cur=c.execute('INSERT INTO cash_transactions(transaction_type,amount,reason,user_id,transaction_date) VALUES(?,?,?,?,?)',('Clôture',float(request.form['amount']),request.form['reason'],session['uid'],now()));c.commit();write_audit('CLÔTURE DE CAISSE','COMPTABILITÉ','SUCCÈS','cash_transactions',cur.lastrowid);flash('Clôture de caisse enregistrée.','success')
+  else:
+   cur=c.execute('INSERT INTO expenses(reason,amount,supplier,user_id,expense_date) VALUES(?,?,?,?,?)',(request.form['reason'],float(request.form['amount']),request.form.get('supplier'),session['uid'],request.form.get('expense_date') or now()));c.commit();write_audit('DÉPENSE','COMPTABILITÉ','SUCCÈS','expenses',cur.lastrowid);flash('Dépense enregistrée.','success')
+ pats=c.execute('SELECT id,patient_number,last_name,first_name FROM patients ORDER BY last_name').fetchall();inv=c.execute('SELECT * FROM invoices ORDER BY id DESC LIMIT 100').fetchall();c.close()
+ body='''<h1>Comptabilité</h1><div class="card"><h3>Facture</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="invoice"><div class="formgrid"><div><label>Patient</label><select name="patient_id"><option value="">Sans patient</option>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>N° facture</label><input name="invoice_number"></div><div><label>Motif</label><input name="reason" required></div><div><label>Montant</label><input name="amount" type="number" step="0.01" required></div></div><br><button>Enregistrer</button></form></div><div class="card"><h3>Paiement</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="payment"><div class="formgrid"><div><label>Patient</label><select name="patient_id"><option value="">Sans patient</option>{% for p in pats %}<option value="{{p.id}}">{{p.patient_number}} — {{p.last_name}} {{p.first_name}}</option>{% endfor %}</select></div><div><label>ID facture (optionnel)</label><input name="invoice_id"></div><div><label>Montant</label><input name="amount" type="number" step="0.01" required></div><div><label>Mode de paiement</label><input name="payment_mode" required></div><div><label>Motif</label><input name="reason"></div></div><br><button>Enregistrer</button></form></div><div class="card"><h3>Dépense</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="expense"><div class="formgrid"><div><label>Motif</label><input name="reason" required></div><div><label>Montant</label><input name="amount" type="number" step="0.01" required></div><div><label>Fournisseur</label><input name="supplier"></div><div><label>Date</label><input name="expense_date"></div></div><br><button>Enregistrer</button></form></div><div class="card"><h3>Clôture de caisse</h3><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="cash_close"><div class="formgrid"><div><label>Montant de clôture</label><input name="amount" type="number" step="0.01" required></div><div><label>Motif</label><input name="reason" required></div></div><br><button>Enregistrer la clôture</button></form></div><div class="card"><h3>Créances / factures à payer</h3>{% for i in inv %}{% if i.status != 'Payée' %}<div>{{i.invoice_number}} — {{i.reason}} — {{i.amount}} — {{i.status}}</div>{% endif %}{% endfor %}</div><div class="card"><table><tr><th>N°</th><th>Motif</th><th>Montant</th><th>Statut</th></tr>{% for i in inv %}<tr><td>{{i.invoice_number}}</td><td>{{i.reason}}</td><td>{{i.amount}}</td><td>{{i.status}}</td></tr>{% endfor %}</table></div>'''
+ return page('Comptabilité',body,pats=pats,inv=inv)
+
+@app.route('/administration',methods=['GET','POST'])
+@roles('Administrateur')
+def administration():
+ c=con()
+ if request.method=='POST':
+  if request.form['action']=='create':
+   rid=c.execute('SELECT id FROM roles WHERE name=?',(request.form['role'],)).fetchone()['id'];t=now()
+   try:cur=c.execute('INSERT INTO users(username,password_hash,role_id,created_at,updated_at) VALUES(?,?,?,?,?)',(request.form['username'],generate_password_hash(request.form['password']),rid,t,t));c.commit();write_audit('CRÉATION UTILISATEUR','ADMINISTRATION','SUCCÈS','users',cur.lastrowid);flash('Utilisateur créé.','success')
+   except (sqlite3.IntegrityError, PGIntegrityError):c.rollback();flash('Nom d’utilisateur déjà utilisé.','danger')
+  else:
+   uid=int(request.form['user_id']);c.execute('UPDATE users SET is_active=CASE WHEN is_active THEN FALSE ELSE TRUE END,updated_at=? WHERE id=?',(now(),uid));c.commit();write_audit('ACTIVATION/DÉSACTIVATION','ADMINISTRATION','SUCCÈS','users',uid);flash('État modifié.','success')
+ users=c.execute('SELECT u.*,r.name role FROM users u JOIN roles r ON r.id=u.role_id ORDER BY username').fetchall();c.close()
+ body='''<h1>Administration</h1><div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="create"><div class="formgrid"><div><label>Utilisateur</label><input name="username" required></div><div><label>Mot de passe</label><input name="password" type="password" required></div><div><label>Rôle</label><select name="role">{% for r in roles %}<option>{{r}}</option>{% endfor %}</select></div></div><br><button>Créer</button></form></div><div class="card"><table><tr><th>Utilisateur</th><th>Rôle</th><th>Actif</th><th>Action</th></tr>{% for u in users %}<tr><td>{{u.username}}</td><td>{{u.role}}</td><td>{{'Oui' if u.is_active else 'Non'}}</td><td>{% if u.id!=user.id %}<form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="toggle"><input type="hidden" name="user_id" value="{{u.id}}"><button>Changer</button></form>{% endif %}</td></tr>{% endfor %}</table></div>'''
+ return page('Administration',body,users=users,roles=ROLES)
+
+@app.route('/audit')
+@roles('Administrateur')
+def audit():
+ c=con();rows=c.execute('SELECT a.*,u.username FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 500').fetchall();c.close();body='''<h1>Journal d’audit</h1><div class="card"><table><tr><th>Date/heure</th><th>Utilisateur</th><th>Action</th><th>Module</th><th>Objet</th><th>ID</th><th>Résultat</th></tr>{% for a in rows %}<tr><td>{{a.date_time}}</td><td>{{a.username or 'Système'}}</td><td>{{a.action}}</td><td>{{a.module}}</td><td>{{a.object_type or ''}}</td><td>{{a.object_id or ''}}</td><td>{{a.result}}</td></tr>{% endfor %}</table></div>''';return page('Audit',body,rows=rows)
+
+@app.route('/reports/pdf')
+@roles('Administrateur','Direction')
+def reports_pdf():
+ from reportlab.lib.pagesizes import A4
+ from reportlab.pdfgen import canvas
+ target=BASE/f"rapport_clinique_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+ cdb=con(); data=[
+  ('Patients',cdb.execute('SELECT COUNT(*) FROM patients').fetchone()[0]),
+  ('Consultations',cdb.execute('SELECT COUNT(*) FROM consultations').fetchone()[0]),
+  ('Hospitalisations',cdb.execute('SELECT COUNT(*) FROM hospitalizations').fetchone()[0]),
+  ('Rendez-vous',cdb.execute('SELECT COUNT(*) FROM appointments').fetchone()[0]),
+  ('Recettes',cdb.execute('SELECT COALESCE(SUM(amount),0) FROM payments').fetchone()[0]),
+  ('Dépenses',cdb.execute('SELECT COALESCE(SUM(amount),0) FROM expenses').fetchone()[0]),
+  ('Stocks faibles',cdb.execute('SELECT COUNT(*) FROM medicines WHERE available_quantity<=minimum_threshold').fetchone()[0])
+ ]; cdb.close()
+ pdf=canvas.Canvas(str(target),pagesize=A4); pdf.setTitle(APP+' - Rapport'); y=800
+ pdf.setFont('Helvetica-Bold',16); pdf.drawString(50,y,APP); y-=28
+ pdf.setFont('Helvetica',11); pdf.drawString(50,y,'Rapport synthétique'); y-=30
+ for label,value in data:
+  pdf.drawString(60,y,f'{label}: {value}'); y-=20
+ pdf.drawString(50,y,f'Généré le {now()}'); pdf.save()
+ write_audit('EXPORT PDF','ADMINISTRATION','SUCCÈS','report',None)
+ return send_file(target,as_attachment=True,download_name=target.name)
+
+@app.route('/reports')
+@roles('Administrateur','Direction')
+def reports():
+ c=con();d={'patients':c.execute('SELECT COUNT(*) FROM patients').fetchone()[0],'consultations':c.execute('SELECT COUNT(*) FROM consultations').fetchone()[0],'hospitalisations':c.execute('SELECT COUNT(*) FROM hospitalizations').fetchone()[0],'rendez_vous':c.execute('SELECT COUNT(*) FROM appointments').fetchone()[0],'recettes':c.execute('SELECT COALESCE(SUM(amount),0) FROM payments').fetchone()[0],'depenses':c.execute('SELECT COALESCE(SUM(amount),0) FROM expenses').fetchone()[0],'stocks_faibles':c.execute('SELECT COUNT(*) FROM medicines WHERE available_quantity<=minimum_threshold').fetchone()[0]};c.close();body='''<h1>Rapports / statistiques</h1><div class="grid">{% for k,v in data.items() %}<div class="card"><div class="small">{{k.replace('_',' ')|upper}}</div><div class="stat">{{v}}</div></div>{% endfor %}</div><div class="card"><button onclick="window.print()">Imprimer</button> <a class="btn" href="{{url_for('reports_pdf')}}">Exporter PDF</a></div>''';return page('Rapports',body,data=d)
+
+@app.errorhandler(403)
+def e403(e):return page('Accès refusé','<div class="card"><h1>Accès refusé</h1><p>Votre rôle ne permet pas cette opération.</p></div>'),403
+@app.errorhandler(400)
+def e400(e):return page('Requête invalide','<div class="card"><h1>Requête invalide</h1><p>Le contrôle de sécurité a rejeté la demande.</p></div>'),400
+if __name__=='__main__':
+ init_db();print(f'{APP} : http://127.0.0.1:5000');app.run(host=os.getenv('CLINIQUE_HOST','127.0.0.1'),port=int(os.getenv('CLINIQUE_PORT','5000')),debug=False)

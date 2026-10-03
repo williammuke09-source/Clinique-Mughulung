@@ -1,0 +1,25 @@
+CLINIQUE MUGHULUNGU — V1.3 — ÉTAT TECHNIQUE
+
+Périmètre
+- Cette version reste dans le cahier des charges V1.0.
+- PostgreSQL est préparé comme base de production multi-utilisateur.
+- SQLite reste disponible pour développement/tests locaux.
+- Les modules fonctionnels du cahier des charges ne sont pas remplacés par des fonctions hors périmètre.
+
+Vérifications effectuées dans cette livraison
+1. Analyse syntaxique du code Python.
+2. Vérification statique de la présence de la configuration PostgreSQL.
+3. Vérification statique de la présence des tables principales du schéma PostgreSQL.
+4. Vérification de cohérence des fichiers de sauvegarde PostgreSQL et de la documentation.
+
+Limite importante
+- Cette livraison ne prétend pas avoir exécuté l'application Flask contre un serveur PostgreSQL réel.
+- Le test d'intégration réel doit être effectué dans l'environnement cible avec PostgreSQL disponible.
+- Une fois PostgreSQL installé, lancer: python tests/verify_v13.py
+- Puis installer les dépendances et lancer l'application avec CLINIQUE_DATABASE_URL configuré.
+- Pour une sauvegarde de production PostgreSQL, utiliser le script pg_dump fourni.
+
+Compte initial
+- Utilisateur: admin
+- Mot de passe initial: ChangeMe-Admin-2026!
+- À modifier avant toute utilisation réelle.
